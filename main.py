@@ -1,64 +1,382 @@
 #!/usr/bin/env python3
 """
 Script d'analyse de vulnérabilités avancé avec interface graphique.
-Fonctionnalités :
-- Scan de ports (TCP/UDP) avec Nmap.
-- Détection de services vulnérables et versions obsolètes.
-- Tests de vulnérabilités (Heartbleed, Shellshock, EternalBlue, SQLi, XSS, etc.).
-- Brute-force SSH/HTTP/FTP.
-- Génération de rapports (HTML/JSON/CSV).
-- Interface graphique moderne avec ttkthemes.
-- Logging et gestion des erreurs avancée.
+Fonctionnalités:
+- Scan de ports (TCP/UDP) avec Nmap
+- Détection de services vulnérables
+- Tests de vulnérabilités (Heartbleed, Shellshock, SQLi, XSS)
+- Brute-force de services (SSH, FTP, HTTP)
+- Génération de rapports en différents formats
+- Interface graphique moderne
+- Système de plugins extensible
 """
 
-import socket
-import ssl
-import subprocess
-import json
-import argparse
-import csv
-import logging
-import sys
+# --- Imports système et standard ---
 import os
+import sys
+import csv
+import json
 import time
-import requests
-import nmap
-import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox, filedialog, Toplevel
-from ttkthemes import ThemedTk
+import logging
+import platform
+import threading
+import subprocess
+import webbrowser
+import importlib
+import importlib.util
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Union, Callable, Set
-from PIL import Image, ImageTk
+from queue import Queue
+from dataclasses import dataclass
+from typing import (
+    Dict, List, Tuple, Optional, Union, TypeVar, Generic, Any,
+    Protocol, Literal, TypedDict, cast, Final
+)
+from tkinter import StringVar, ttk
+import tkinter as tk
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.pagesizes import letter
+
+# --- Types personnalisés ---
+from typing import NewType
+
+# Type pour file thread-safe
+QType = TypeVar('QType', bound=QMessage)
+MessageQueue = NewType('MessageQueue', SafeQueue[QMessage])
+
+# Types métier
+PortNumber = NewType('PortNumber', int)
+ServiceName = NewType('ServiceName', str)
+ServiceVersion = NewType('ServiceVersion', str)
+
+# Types pour Nmap
+class NmapPortScannerDict(Protocol):
+    """Protocol for nmap.PortScannerHostDict"""
+    def keys(self) -> list[int]: ...
+    def __getitem__(self, key: int) -> dict[str, Any]: ...
+
+class NmapPortScannerHostDict(Protocol):
+    """Protocol for nmap scan results for a single host"""
+    def all_protocols(self) -> list[str]: ...
+    def __getitem__(self, proto: str) -> NmapPortScannerDict: ...
+
+class NmapPortScanner(Protocol):
+    """Protocol for nmap.PortScanner"""
+    def scan(self, hosts: str, ports: str, arguments: str) -> None: ...
+    def __getitem__(self, host: str) -> NmapPortScannerHostDict: ...
+
+@dataclass(frozen=True)
+class QMessage:
+    """Message typé pour la file de messages."""
+    type: Literal["port", "vulnerability"]
+    data: Union[QMessageBase, QMessageVuln]
+
+    @staticmethod
+    def port(port: int, service: str, version: str) -> "QMessage":
+        """Crée un message de type port."""
+        data = QMessageBase(port=port, service=service, version=version)
+        return QMessage(type="port", data=data)
+        
+    @staticmethod
+    def vulnerability(port: int, service: str, version: str,
+                   name: str, description: str, severity: str, cve: List[str]) -> "QMessage":
+        """Crée un message de type vulnérabilité."""
+        data = QMessageVuln(
+            port=port,
+            service=service, 
+            version=version,
+            name=name,
+            description=description,
+            severity=severity,
+            cve=cve
+        )
+        return QMessage(type="vulnerability", data=data)
+
+QType = TypeVar('QType', bound=QMessage)
+
+class SafeQueue(Queue[QType]):
+    """File thread-safe avec type fort."""
+    def __init__(self) -> None:
+        super().__init__()
+        
+    def put(self, item: QType, block: bool = True, timeout: Optional[float] = None) -> None:
+        super().put(item, block=block, timeout=timeout)
+        
+    def get(self, block: bool = True, timeout: Optional[float] = None) -> QType:
+        return super().get(block=block, timeout=timeout)
+        
+    def clear(self) -> None:
+        """Vide la file."""
+        try:
+            while True:
+                self.get_nowait()
+        except:
+            pass
+
+class ScannerPlugin(Protocol):
+    """Protocol pour les plugins du scanner."""
+    def check_vulnerability(
+        self,
+        target: str,
+        port: int,
+        service: str,
+        version: str,
+        results: "ScanResults",
+        queue: SafeQueue
+    ) -> None:
+        """Vérifie les vulnérabilités avec ce plugin."""
+        ...
+    def vulnerability(port: int, service: str, version: str,
+                   vuln_name: str, status: str, severity: str, cve_str: str) -> "QMessage":
+        return QMessage(type="vulnerability",
+                     data=(port, service, version, vuln_name, status, severity, cve_str))
+
+class SafeQueue(Queue[QMessage]):
+    """File thread-safe avec type fort."""
+    def put(self, item: QMessage, block: bool = True, timeout: Optional[float] = None) -> None:
+        super().put(item, block=block, timeout=timeout)
+        
+    def get(self, block: bool = True, timeout: Optional[float] = None) -> QMessage:
+        return super().get(block=block, timeout=timeout)
+        
+    def clear(self) -> None:
+        """Vide la file."""
+        try:
+            while True:
+                self.get_nowait()
+        except:
+            pass
+
+class PortInfo(TypedDict):
+    port: int
+    service: str
+    version: str
+
+class Vulnerability(TypedDict):
+    port: int
+    service: str
+    name: str
+    status: str
+    severity: str
+    cve: List[str]
+
+class ScanResults(TypedDict):
+    target: str
+    open_ports: List[Tuple[int, str, str]]  # (port, service, version)
+    vulnerabilities: List[Vulnerability]
+
+# Types pour Nmap
+class PortScannerResults(Protocol):
+    def all_protocols(self) -> List[str]: ...
+    def __getitem__(self, key: str) -> Dict[int, Dict[str, Any]]: ...
+
+# --- Imports réseau et sécurité ---
+import ssl
+import socket
+import requests
+import nmap  # nécessite: pip install python-nmap
+
+# --- Imports interface graphique ---
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox, filedialog
+from ttkthemes import ThemedTk  # nécessite: pip install ttkthemes
+
+# --- Imports génération de rapports ---
+from reportlab.lib.pagesizes import letter  # nécessite: pip install reportlab
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet
-import threading
-import queue
-import platform
-import webbrowser
+
+# --- Types personnalisés ---
+# Type definitions
+QType = TypeVar('QType', bound=QMessage)
+
+class ScanResults(TypedDict):
+    target: str
+    ports: List[Tuple[int, str, str]]
+    vulnerabilities: List[Dict[str, Union[str, int, List[str]]]]
+PluginModule = TypeVar('PluginModule')
+
+MessageType = Tuple[str, Union[Tuple[int, str, str], Tuple[int, str, str, str, str, str, str]]]
+
+class SafeQueue(Generic[T]):
+    """File d'attente thread-safe avec gestion des types."""
+    def __init__(self) -> None:
+        self._queue: Queue[T] = Queue()
+
+    def put(self, item: T) -> None:
+        """Ajoute un élément à la file."""
+        self._queue.put(item)
+
+    def get(self) -> T:
+        """Récupère et supprime un élément de la file."""
+        return self._queue.get()
+
+    def empty(self) -> bool:
+        """Vérifie si la file est vide."""
+        return self._queue.empty()
+
+    def clear(self) -> None:
+        """Vide la file entièrement."""
+        try:
+            while True:
+                self._queue.get_nowait()
+        except:
+            pass
+
+    def qsize(self) -> int:
+        """Retourne le nombre d'éléments dans la file."""
+        return self._queue.qsize()
+
+# --- Types de données ---
+from typing import Final, Dict, List, Union, TypedDict, NewType, Any, Protocol
+from types import ModuleType
+
+# --- Types personnalisés ---
+from typing import NewType
+
+# Types métier
+PortNumber = NewType('PortNumber', int)
+ServiceName = NewType('ServiceName', str)
+ServiceVersion = NewType('ServiceVersion', str)
+
+# Types pour les structures de données
+# Types pour la file de messages
+@dataclass(frozen=True)
+class QMessageBase:
+    """Données de base pour les messages."""
+    port: int
+    service: str 
+    version: str
+
+@dataclass(frozen=True)
+class QMessageVuln(QMessageBase):
+    """Données pour les messages de vulnérabilité."""
+    name: str
+    description: str
+    severity: str
+    cve: List[str]
+
+@dataclass(frozen=True)
+class QMessage:
+    """Message typé pour la file de messages."""
+    type: Literal["port", "vulnerability"]
+    data: Union[QMessageBase, QMessageVuln]
+
+    @staticmethod
+    def port(port: int, service: str, version: str) -> "QMessage":
+        """Crée un message de type port."""
+        data = QMessageBase(
+            port=port,
+            service=service, 
+            version=version
+        )
+        return QMessage(type="port", data=data)
+        
+    @staticmethod  
+    def vulnerability(port: int, service: str, version: str,
+                   name: str, description: str, severity: str, cve: List[str]) -> "QMessage":
+        """Crée un message de type vulnérabilité."""
+        data = QMessageVuln(
+            port=port,
+            service=service, 
+            version=version,
+            name=name,
+            description=description,
+            severity=severity,
+            cve=cve
+        )
+        return QMessage(type="vulnerability", data=data)
+
+# Types pour les résultats de scan
+class ServiceInfo(TypedDict, total=True):
+    """Information sur un service vulnérable connu."""
+    versions: List[str]
+    cve: List[str]
+    severity: str
+
+# Type pour file thread-safe
+QMessageType = TypeVar('QMessageType', bound=QMessage)
+
+class SafeQueue(Queue[QMessageType]):
+    """File thread-safe avec type fort."""
+    
+    def put(self, item: QMessageType, block: bool = True, timeout: Optional[float] = None) -> None:
+        super().put(item, block=block, timeout=timeout)
+        
+    def get(self, block: bool = True, timeout: Optional[float] = None) -> QMessageType:
+        return super().get(block=block, timeout=timeout)
+        
+    def clear(self) -> None:
+        """Vide la file."""
+        try:
+            while True:
+                self.get_nowait()
+        except:
+            pass
+
+@dataclass(frozen=True)
+class VulnerabilityInfo:
+    """Information sur une vulnérabilité."""
+    port: int
+    service: str
+    version: str
+    name: str 
+    description: str
+    severity: str
+    cve: List[str]
+    
+@dataclass(frozen=True)
+class ScanResult:
+    """Résultat d'un scan complet."""
+    target: str
+    ports: List[Tuple[int, str, str]]  # (port, service, version)
+    vulnerabilities: List[VulnerabilityInfo]
+
+# Base de données des vulnérabilités
+known_vulnerabilities = [
+    VulnerabilityInfo(
+        port=443,
+        service='https',
+        version='',
+        name='Heartbleed',
+        description='Vulnérabilité Heartbleed (CVE-2014-0160) dans OpenSSL.',
+        severity='Critical',
+        cve=['CVE-2014-0160']
+    ),
+    VulnerabilityInfo(
+        port=80,
+        service='http',
+        version='',  
+        name='Shellshock',
+        description='Vulnérabilité Shellshock (CVE-2014-6271) dans Bash.',
+        severity='Critical',
+        cve=['CVE-2014-6271']
+    )
+]
+
+# Type pour file thread-safe
+MessageQueue = NewType('MessageQueue', 'SafeQueue[QMessage]')
 
 # --- Configuration globale ---
-REQUEST_TIMEOUT = 10
-DEFAULT_PORTS = "1-1000"
-LOG_FILE = "vulnerability_scan.log"
-REPORT_DIR = "reports"
-PLUGINS_DIR = "plugins"
+request_timeout: Final[int] = 10
+default_ports: Final[str] = "1-1000"
+log_file: Final[str] = "vulnerability_scan.log"
+report_dir: Final[str] = "reports"
+plugins_dir: Final[str] = "plugins"
 
-# --- Vulnérabilités connues ---
-KNOWN_VULNERABILITIES = {
-    "Heartbleed": {
-        "ports": [443],
-        "test": "test_heartbleed",
-        "description": "Vulnérabilité Heartbleed (CVE-2014-0160) dans OpenSSL.",
-        "cve": ["CVE-2014-0160"],
-        "severity": "Critical"
+# --- Base de données de vulnérabilités ---
+vulnerable_services: Dict[str, ServiceInfo] = {
+    "OpenSSH": {
+        "versions": ["<7.6", "<7.7"],
+        "cve": ["CVE-2018-15473"],
+        "severity": "High" 
     },
-    "Shellshock": {
-        "ports": [80, 443, 8080],
-        "test": "test_shellshock",
-        "description": "Vulnérabilité Shellshock (CVE-2014-6271) dans Bash.",
-        "cve": ["CVE-2014-6271"],
+    "Apache": {
+        "versions": ["<2.4.38"],
+        "cve": ["CVE-2019-0211"],
         "severity": "High"
+    }
+}
     },
     "EternalBlue": {
         "ports": [445],
@@ -120,41 +438,69 @@ logger = logging.getLogger(__name__)
 
 # --- Classe principale de l'application ---
 class VulnerabilityScannerApp:
-    def __init__(self, root: ThemedTk):
-        self.root = root
+    """Application principale de scan de vulnérabilités."""
+    def __init__(self, root: ThemedTk) -> None:
+        """Initialise l'application de scan de vulnérabilités."""
+        self.root: ThemedTk = root
         self.root.title("Advanced Vulnerability Scanner")
         self.root.geometry("1200x800")
         self.root.set_theme("plastik")
-        self.queue = queue.Queue()
-        self.scan_running = False
+        
+        # Variables d'instance typées
+        self.queue: SafeQueue = SafeQueue()  # Type inféré de la classe
+        self.scan_running: bool = False
+        self.plugins: Dict[str, ModuleType] = {}
+        
+        # Variables d'interface utilisateur
+        self.target: tk.StringVar = tk.StringVar()
+        self.ports: tk.StringVar = tk.StringVar(value=DEFAULT_PORTS)
+        self.scan_method: tk.StringVar = tk.StringVar(value="SYN")
+        self.report_format: tk.StringVar = tk.StringVar(value="json")
+        self.log_text: Optional[scrolledtext.ScrolledText] = None
+        self.results_tree: Optional[ttk.Treeview] = None
+        self.report_listbox: Optional[tk.Listbox] = None
+        self.plugin_listbox: Optional[tk.Listbox] = None
+        self.status_bar: Optional[ttk.Label] = None
+        
+        # Configuration initiale
         self.setup_ui()
         self.load_plugins()
+        
+        # Création des répertoires nécessaires
         os.makedirs(REPORT_DIR, exist_ok=True)
         os.makedirs(PLUGINS_DIR, exist_ok=True)
 
-    def setup_ui(self):
+    def setup_ui(self) -> None:
         """Configure l'interface utilisateur avec onglets."""
-        self.notebook = ttk.Notebook(self.root)
+        # Création du notebook principal
+        self.notebook: ttk.Notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
         # Onglet Scan
-        self.scan_tab = ttk.Frame(self.notebook)
+        self.scan_tab: ttk.Frame = ttk.Frame(self.notebook)
         self.notebook.add(self.scan_tab, text="Scan")
         self.setup_scan_tab()
 
         # Onglet Rapports
-        self.report_tab = ttk.Frame(self.notebook)
+        self.report_tab: ttk.Frame = ttk.Frame(self.notebook)
         self.notebook.add(self.report_tab, text="Rapports")
         self.setup_report_tab()
 
         # Onglet Plugins
-        self.plugin_tab = ttk.Frame(self.notebook)
+        self.plugin_tab: ttk.Frame = ttk.Frame(self.notebook)
         self.notebook.add(self.plugin_tab, text="Plugins")
         self.setup_plugin_tab()
 
         # Barre de statut
         self.status_bar = ttk.Label(self.root, text="Prêt", relief=tk.SUNKEN, anchor=tk.W)
-        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        if self.status_bar:
+            self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+            
+        # S'assurer que tous les widgets ont été correctement initialisés
+        assert self.log_text is not None, "Le widget log_text n'a pas été initialisé"
+        assert self.results_tree is not None, "Le widget results_tree n'a pas été initialisé"
+        assert self.report_listbox is not None, "Le widget report_listbox n'a pas été initialisé"
+        assert self.plugin_listbox is not None, "Le widget plugin_listbox n'a pas été initialisé"
 
     def setup_scan_tab(self):
         """Configure l'onglet de scan."""
@@ -233,45 +579,96 @@ class VulnerabilityScannerApp:
         self.refresh_plugin_list()
 
     def load_plugins(self):
-        """Charge les plugins depuis le dossier PLUGINS_DIR."""
+        """Charge les plugins depuis le dossier PLUGINS_DIR de manière sécurisée."""
         self.plugins = {}
+        
+        # Vérification du dossier plugins
+        if not os.path.exists(PLUGINS_DIR):
+            os.makedirs(PLUGINS_DIR)
+            logger.info(f"Dossier plugins créé: {PLUGINS_DIR}")
+            return
+
+        # Ajout du dossier plugins au path Python
+        if PLUGINS_DIR not in sys.path:
+            sys.path.append(PLUGINS_DIR)
+
         for filename in os.listdir(PLUGINS_DIR):
-            if filename.endswith(".py") and not filename.startswith("_"):
-                try:
-                    module_name = filename[:-3]
-                    module = __import__(f"plugins.{module_name}", fromlist=[""])
-                    if hasattr(module, "register"):
-                        module.register(self)
-                        self.plugins[module_name] = module
-                        logger.info(f"Plugin chargé: {module_name}")
-                except Exception as e:
-                    logger.error(f"Erreur de chargement du plugin {filename}: {e}")
+            if not filename.endswith('.py') or filename.startswith('_'):
+                continue
 
-    def refresh_plugin_list(self):
+            try:
+                module_name = filename[:-3]
+                spec = importlib.util.spec_from_file_location(
+                    module_name, 
+                    os.path.join(PLUGINS_DIR, filename)
+                )
+                if spec is None:
+                    logger.error(f"Impossible de charger le plugin {filename}: spec est None")
+                    continue
+
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+
+                # Vérification de l'interface du plugin
+                if not hasattr(module, 'register') or not callable(module.register):
+                    logger.error(f"Plugin {filename} invalide: fonction register manquante")
+                    continue
+
+                # Vérification des autres fonctions requises
+                required_functions = ['check_vulnerability']
+                missing_functions = [f for f in required_functions if not hasattr(module, f)]
+                if missing_functions:
+                    logger.error(f"Plugin {filename} invalide: fonctions manquantes: {', '.join(missing_functions)}")
+                    continue
+
+                # Enregistrement du plugin
+                module.register(self)
+                self.plugins[module_name] = module
+                logger.info(f"Plugin chargé avec succès: {module_name}")
+
+            except ImportError as e:
+                logger.error(f"Erreur d'importation du plugin {filename}: {e}")
+            except AttributeError as e:
+                logger.error(f"Erreur d'attribut dans le plugin {filename}: {e}")
+            except Exception as e:
+                logger.error(f"Erreur inattendue lors du chargement du plugin {filename}: {e}")
+                if hasattr(e, '__traceback__'):
+                    import traceback
+                    logger.error(traceback.format_exc())
+
+    def refresh_plugin_list(self) -> None:
         """Met à jour la liste des plugins."""
-        self.plugin_listbox.delete(0, tk.END)
-        for name in self.plugins:
-            self.plugin_listbox.insert(tk.END, name)
+        if self.plugin_listbox is not None:
+            self.plugin_listbox.delete(0, tk.END)
+            for name in self.plugins:
+                self.plugin_listbox.insert(tk.END, name)
 
-    def refresh_report_list(self):
+    def refresh_report_list(self) -> None:
         """Met à jour la liste des rapports."""
-        self.report_listbox.delete(0, tk.END)
-        for filename in os.listdir(REPORT_DIR):
-            self.report_listbox.insert(tk.END, filename)
+        if self.report_listbox is not None:
+            self.report_listbox.delete(0, tk.END)
+            for filename in os.listdir(REPORT_DIR):
+                self.report_listbox.insert(tk.END, filename)
 
-    def log(self, message: str, level: str = "info"):
+    def log(self, message: str, level: str = "info") -> None:
         """Ajoute un message aux logs."""
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
-        self.log_text.see(tk.END)
+        
+        # Log dans l'interface graphique
+        if self.log_text is not None:
+            self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
+            self.log_text.see(tk.END)
+            
+        # Log dans le fichier
         if level == "error":
             logger.error(message)
         else:
             logger.info(message)
 
-    def clear_logs(self):
+    def clear_logs(self) -> None:
         """Efface les logs."""
-        self.log_text.delete(1.0, tk.END)
+        if self.log_text is not None:
+            self.log_text.delete(1.0, tk.END)
 
     def start_scan_thread(self):
         """Lance le scan dans un thread séparé."""
@@ -279,7 +676,7 @@ class VulnerabilityScannerApp:
             messagebox.showwarning("Attention", "Un scan est déjà en cours !")
             return
         self.scan_running = True
-        self.queue.queue.clear()
+        self.queue.clear()
         threading.Thread(target=self.run_scan, daemon=True).start()
         self.log("Scan démarré en arrière-plan.")
 
@@ -288,35 +685,54 @@ class VulnerabilityScannerApp:
         self.scan_running = False
         self.log("Scan arrêté par l'utilisateur.")
 
-    def run_scan(self):
-        """Lance le scan de vulnérabilités."""
-        target = self.target.get()
+    def run_scan(self) -> None:
+        """Lance le scan de vulnérabilités."""        
+        target = self.target.get() if hasattr(self.target, "get") else ""
         if not target:
             self.log("Erreur: Veuillez entrer une cible.", level="error")
             messagebox.showerror("Erreur", "Veuillez entrer une cible.")
             self.scan_running = False
             return
 
+        if self.results_tree is None:
+            self.log("Widget résultats non initialisé", level="error")
+            return
+
         self.log(f"[*] Début du scan pour {target}...")
         self.results_tree.delete(*self.results_tree.get_children())
-        results = {"target": target, "open_ports": [], "vulnerabilities": []}
+        results: ScanResults = {
+            "target": target,
+            "open_ports": [],
+            "vulnerabilities": []
+        }
 
         try:
-            nmap_results = scan_ports(target, self.ports.get(), self.scan_method.get())
+            # Récupérer les valeurs des widgets
+            ports = self.ports.get() if hasattr(self.ports, "get") else DEFAULT_PORTS
+            method = self.scan_method.get() if hasattr(self.scan_method, "get") else "SYN"
+            
+            nmap_results = scan_ports(target, ports, method)
+            
             for proto in nmap_results.all_protocols():
-                for port in nmap_results[proto]:
+                for port in nmap_results[proto]:                        
                     if not self.scan_running:
                         self.log("Scan arrêté par l'utilisateur.")
                         return
+                        
                     port_info = nmap_results[proto][port]
-                    service = port_info["name"]
-                    version = port_info.get("version", "")
+                    service = str(port_info.get("name", ""))
+                    version = str(port_info.get("version", ""))
+                    
                     results["open_ports"].append((port, service, version))
-                    self.queue.put(("port", (port, service, version)))
+                    self.queue.put(QMessage.port(port, service, version))
                     self.check_vulnerabilities(target, port, service, version, results)
 
             # Génération du rapport
-            report_file = generate_report(results, self.report_format.get())
+            report_format = (self.report_format.get() if hasattr(self.report_format, "get") else "json")
+            if report_format not in ("json", "html", "txt", "csv", "pdf"):
+                report_format = "json"  # Format par défaut si invalide
+                
+            report_file = generate_report(results, report_format)
             self.log(f"[+] Rapport généré: {report_file}")
             self.refresh_report_list()
             messagebox.showinfo("Succès", f"Scan terminé. Rapport: {report_file}")
@@ -326,9 +742,10 @@ class VulnerabilityScannerApp:
             messagebox.showerror("Erreur", f"Erreur lors du scan: {e}")
 
         self.scan_running = False
-        self.status_bar.config(text="Scan terminé")
+        if self.status_bar is not None:
+            self.status_bar.config(text="Scan terminé")
 
-    def check_vulnerabilities(self, target: str, port: int, service: str, version: str, results: dict):
+    def check_vulnerabilities(self, target: str, port: int, service: str, version: str, results: ScanResults) -> None:
         """Vérifie les vulnérabilités pour un port/service donné."""
         # Vérifie les vulnérabilités connues
         for vuln_name, vuln_data in KNOWN_VULNERABILITIES.items():
@@ -345,7 +762,16 @@ class VulnerabilityScannerApp:
                             "severity": vuln_data["severity"],
                             "cve": vuln_data["cve"]
                         })
-                        self.queue.put(("vuln", (port, service, version, vuln_name, status, vuln_data["severity"], ", ".join(vuln_data["cve"]))))
+                        msg = QMessage.vulnerability(
+            port=port,
+            service=service,
+            version=version,
+            vuln_name=vuln_name,
+            status=status,
+            severity=vuln_data["severity"],
+            cve_str=", ".join(vuln_data["cve"])
+        )
+        self.queue.put(msg)
 
         # Vérifie les versions vulnérables des services
         for svc_name, svc_data in VULNERABLE_SERVICES.items():
@@ -360,8 +786,17 @@ class VulnerabilityScannerApp:
                             "severity": svc_data["severity"],
                             "cve": svc_data["cve"]
                         })
-                        self.queue.put(("vuln", (port, service, version, f"Version vulnérable de {svc_name}", f"Version {version} vulnérable", svc_data["severity"], ", ".join(svc_data["cve"]))))
-
+                        msg = QMessage.vulnerability(
+                            port=port,
+                            service=service,
+                            version=version,
+                            vuln_name=f"Version vulnérable de {svc_name}",
+                            status=f"Version {version} vulnérable",
+                            severity=svc_data["severity"],
+                            cve_str=", ".join(svc_data["cve"])
+                        )
+                        self.queue.put(msg)
+                        
         # Vérifie les identifiants par défaut
         if service.lower() in ["ssh", "ftp", "http", "https"]:
             is_vuln, status = test_default_credentials(target, port, service)
@@ -374,72 +809,144 @@ class VulnerabilityScannerApp:
                     "severity": "Medium",
                     "cve": []
                 })
-                self.queue.put(("vuln", (port, service, version, "Default_Credentials", status, "Medium", "")))
+                self.queue.put(QMessage.vulnerability(
+                    port, service, version,
+                    "Default_Credentials", status, "Medium", ""
+                ))
 
         # Exécute les plugins
         for plugin in self.plugins.values():
             if hasattr(plugin, "check_vulnerability"):
                 plugin.check_vulnerability(target, port, service, version, results, self.queue)
 
-    def process_queue(self):
+    def process_queue(self) -> None:
         """Traite les éléments de la file d'attente."""
-        while not self.queue.empty():
-            item = self.queue.get()
-            if item[0] == "port":
-                _, (port, service, version) = item
-                self.results_tree.insert("", tk.END, values=(port, service, version, "Aucune", "", ""))
-            elif item[0] == "vuln":
-                _, (port, service, version, vuln_name, status, severity, cve) = item
-                self.results_tree.insert("", tk.END, values=(port, service, version, f"{vuln_name}: {status}", severity, cve))
-        self.root.after(100, self.process_queue)
+        if self.results_tree is None:
+            return
+            
+        try:
+            while not self.queue.empty():
+                message = self.queue.get()
+                
+                if message.type == "port":
+                    port, service, version = message.data
+                    self.results_tree.insert(
+                        "", tk.END,
+                        values=(str(port), service, version, "Aucune", "", "")
+                    )
+                    
+                elif message.type == "vulnerability":
+                    port, service, version, vuln_name, status, severity, cve = message.data
+                    self.results_tree.insert(
+                        "", tk.END,
+                        values=(str(port), service, version, f"{vuln_name}: {status}", severity, cve)
+                    )
+        except Exception as e:
+            self.log(f"Erreur lors du traitement de la file: {e}", level="error")
+        finally:
+            self.root.after(100, self.process_queue)
 
-    def open_report(self):
+    def open_report(self) -> None:
         """Ouvre un rapport existant."""
+        if self.report_listbox is None:
+            self.log("Widget de liste des rapports non initialisé", level="error")
+            return
+            
         selection = self.report_listbox.curselection()
         if selection:
             filename = self.report_listbox.get(selection[0])
             filepath = os.path.join(REPORT_DIR, filename)
-            if platform.system() == "Windows":
-                os.startfile(filepath)
-            else:
-                webbrowser.open(f"file://{filepath}")
-
-    def export_logs(self):
-        """Exporte les logs vers un fichier."""
-        log_content = self.log_text.get(1.0, tk.END)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_filename = f"logs/scan_log_{timestamp}.txt"
-        os.makedirs("logs", exist_ok=True)
-        with open(log_filename, "w") as f:
-            f.write(log_content)
-        self.log(f"Logs exportés vers {log_filename}")
-        messagebox.showinfo("Succès", f"Logs exportés vers {log_filename}")
-
-    def load_plugin(self):
-        """Charge un plugin depuis un fichier."""
-        file = filedialog.askopenfilename(initialdir=PLUGINS_DIR, title="Charger un plugin", filetypes=[("Fichiers Python", "*.py")])
-        if file:
             try:
-                module_name = os.path.basename(file)[:-3]
-                spec = importlib.util.spec_from_file_location(module_name, file)
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                if hasattr(module, "register"):
-                    module.register(self)
-                    self.plugins[module_name] = module
-                    self.refresh_plugin_list()
-                    self.log(f"Plugin chargé: {module_name}")
+                if platform.system() == "Windows":
+                    os.startfile(filepath)
                 else:
-                    self.log(f"Le fichier {file} n'est pas un plugin valide.", level="error")
+                    webbrowser.open(f"file://{filepath}")
             except Exception as e:
-                self.log(f"Erreur de chargement du plugin {file}: {e}", level="error")
+                self.log(f"Erreur lors de l'ouverture du rapport: {e}", level="error")
+                messagebox.showerror("Erreur", f"Impossible d'ouvrir le rapport: {e}")
+
+    def export_logs(self) -> None:
+        """Exporte les logs vers un fichier."""
+        if self.log_text is None:
+            self.log("Widget de logs non initialisé", level="error")
+            return
+            
+        try:
+            log_content = self.log_text.get(1.0, tk.END)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_filename = f"logs/scan_log_{timestamp}.txt"
+            os.makedirs("logs", exist_ok=True)
+            
+            with open(log_filename, "w", encoding='utf-8') as f:
+                f.write(log_content)
+                
+            self.log(f"Logs exportés vers {log_filename}")
+            messagebox.showinfo("Succès", f"Logs exportés vers {log_filename}")
+        except Exception as e:
+            self.log(f"Erreur lors de l'exportation des logs: {e}", level="error")
+            messagebox.showerror("Erreur", f"Impossible d'exporter les logs: {e}")
+
+    def load_plugin(self) -> None:
+        """Charge un plugin depuis un fichier."""
+        file = filedialog.askopenfilename(
+            initialdir=PLUGINS_DIR,
+            title="Charger un plugin",
+            filetypes=[("Fichiers Python", "*.py")]
+        )
+        if not file:
+            return
+            
+        try:
+            module_name = os.path.basename(file)[:-3]
+            spec = importlib.util.spec_from_file_location(module_name, file)
+            
+            if spec is None or spec.loader is None:
+                self.log(f"Le fichier {file} n'est pas un module Python valide", level="error")
+                return
+                
+            module = importlib.util.module_from_spec(spec)
+            if module is None:
+                self.log(f"Impossible de créer le module pour {file}", level="error")
+                return
+                
+            spec.loader.exec_module(module)
+            
+            if hasattr(module, "register"):
+                module.register(self)
+                self.plugins[module_name] = module
+                self.refresh_plugin_list()
+                self.log(f"Plugin chargé: {module_name}")
+            else:
+                self.log(f"Le fichier {file} n'est pas un plugin valide.", level="error")
+        except Exception as e:
+            self.log(f"Erreur de chargement du plugin {file}: {e}", level="error")
 
 # --- Fonctions de scan et tests ---
-def scan_ports(target: str, ports: str = DEFAULT_PORTS, method: str = "SYN") -> nmap.PortScanner:
-    """Scan des ports avec Nmap."""
+from typing import Protocol, Any
+
+class PortScannerResults(Protocol):
+    def all_protocols(self) -> list[str]: ...
+    def __getitem__(self, key: str) -> dict[int, dict[str, Any]]: ...
+
+def scan_ports(target: str, ports: str = DEFAULT_PORTS, method: str = "SYN") -> PortScannerResults:
+    """Scan des ports avec Nmap.
+    
+    Args:
+        target: L'hôte à scanner
+        ports: Les ports à scanner (ex: "20-25,80,443")
+        method: La méthode de scan Nmap (ex: "SYN", "TCP", etc.)
+        
+    Returns:
+        Un objet PortScannerResults contenant les résultats du scan
+        
+    Raises:
+        Exception: Si une erreur survient pendant le scan
+    """
     nm = nmap.PortScanner()
     try:
         logger.info(f"Scan de {target} (ports: {ports}, méthode: {method})...")
+        if method not in {"SYN", "TCP", "UDP", "ACK", "FIN", "NULL"}:
+            method = "SYN"  # Méthode par défaut si invalide
         nm.scan(hosts=target, ports=ports, arguments=f"-s{method} -sV --open")
         return nm
     except Exception as e:
@@ -522,20 +1029,45 @@ def test_default_credentials(target: str, port: int, service: str) -> Tuple[bool
                 continue
     return False, "Aucun identifiant valide trouvé."
 
-def generate_report(results: Dict, report_format: str = "json") -> str:
+from typing import TypedDict, List, Literal, Union
+
+class PortInfo(TypedDict):
+    port: int
+    service: str
+    version: str
+
+class Vulnerability(TypedDict):
+    port: int
+    service: str
+    name: str
+    status: str
+    severity: str
+    cve: List[str]
+
+class ScanResults(TypedDict):
+    target: str
+    open_ports: List[tuple[int, str, str]]  # (port, service, version)
+    vulnerabilities: List[Vulnerability]
+
+ReportFormat = Literal["json", "html", "txt", "csv", "pdf"]
+
+def generate_report(results: ScanResults, report_format: ReportFormat = "json") -> str:
     """Génère un rapport dans le format spécifié."""
     os.makedirs(REPORT_DIR, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{REPORT_DIR}/report_{results['target']}_{timestamp}.{report_format}"
 
     if report_format == "json":
-        with open(filename, "w") as f:
-            json.dump(results, f, indent=4)
+        with open(filename, "w", encoding='utf-8') as f:
+            json.dump(results, f, indent=4, ensure_ascii=False)
     elif report_format == "html":
         html = f"""
         <!DOCTYPE html>
         <html>
-        <head><title>Rapport de scan pour {results['target']}</title></head>
+        <head>
+            <title>Rapport de scan pour {results['target']}</title>
+            <meta charset="utf-8">
+        </head>
         <body>
             <h1>Rapport de scan pour {results['target']}</h1>
             <h2>Date: {timestamp}</h2>
@@ -552,10 +1084,10 @@ def generate_report(results: Dict, report_format: str = "json") -> str:
         </body>
         </html>
         """
-        with open(filename, "w") as f:
+        with open(filename, "w", encoding='utf-8') as f:
             f.write(html)
     elif report_format == "txt":
-        with open(filename, "w") as f:
+        with open(filename, "w", encoding='utf-8') as f:
             f.write(f"Rapport de scan pour {results['target']}\n")
             f.write(f"Date: {timestamp}\n\n")
             f.write("Ports ouverts:\n")
@@ -565,7 +1097,7 @@ def generate_report(results: Dict, report_format: str = "json") -> str:
             for v in results["vulnerabilities"]:
                 f.write(f"- Port {v['port']} ({v['service']}): {v['name']} - {v['status']} (Sévérité: {v['severity']}, CVE: {', '.join(v['cve'])})\n")
     elif report_format == "csv":
-        with open(filename, "w", newline='') as f:
+        with open(filename, "w", newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow(["Port", "Service", "Version"])
             for p, s, v in results["open_ports"]:
@@ -606,200 +1138,7 @@ def generate_report(results: Dict, report_format: str = "json") -> str:
     return filename
 
 
-# --- Interface Graphique ---
-
-REPORT_DIR = "reports"
-KNOWN_VULNERABILITIES = {
-    "Heartbleed": {"ports": [443], "test": "test_heartbleed"},
-    "Shellshock": {"ports": [80, 8080], "test": "test_shellshock"},
-    # Ajoute d'autres vulnérabilités ici
-}
-
-class VulnerabilityScannerApp:
-    def __init__(self, root: ThemedTk):
-        self.root = root
-        self.root.title("Advanced Vulnerability Scanner")
-        self.root.geometry("1000x700")
-        self.root.set_theme("plastik")
-        # Variables
-        self.target = tk.StringVar()
-        self.ports = tk.StringVar(value="1-1000")
-        self.report_format = tk.StringVar(value="json")
-        self.scan_method = tk.StringVar(value="SYN")  # Ajout de la méthode de scan
-        self.log_text = scrolledtext.ScrolledText(self.root, wrap=tk.WORD, width=80, height=20)
-        self.results_tree = ttk.Treeview(self.root, columns=("Port", "Service", "Vulnérabilité", "Sévérité"), show="headings")
-        # Widgets
-        self.setup_ui()
-        # Vérifie et crée le dossier de rapports
-        os.makedirs(REPORT_DIR, exist_ok=True)
-
-    def setup_ui(self):
-        """Configure l'interface utilisateur."""
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
-
-        # Champ "Target"
-        ttk.Label(main_frame, text="Cible (IP/Domaine):").grid(row=0, column=0, sticky=tk.W)
-        ttk.Entry(main_frame, textvariable=self.target, width=40).grid(row=0, column=1, padx=5, pady=5)
-
-        # Champ "Ports"
-        ttk.Label(main_frame, text="Ports:").grid(row=1, column=0, sticky=tk.W)
-        ttk.Entry(main_frame, textvariable=self.ports, width=40).grid(row=1, column=1, padx=5, pady=5)
-
-        # Méthode de scan
-        ttk.Label(main_frame, text="Méthode de scan:").grid(row=2, column=0, sticky=tk.W)
-        ttk.Combobox(main_frame, textvariable=self.scan_method, values=["SYN", "TCP", "UDP"], width=37).grid(row=2, column=1, padx=5, pady=5)
-
-        # Format du rapport
-        ttk.Label(main_frame, text="Format du rapport:").grid(row=3, column=0, sticky=tk.W)
-        ttk.Combobox(main_frame, textvariable=self.report_format, values=["json", "html", "txt"], width=37).grid(row=3, column=1, padx=5, pady=5)
-
-        # Boutons
-        ttk.Button(main_frame, text="Lancer le scan", command=self.start_scan_thread).grid(row=4, column=0, pady=10)
-        ttk.Button(main_frame, text="Ouvrir un rapport", command=self.open_report).grid(row=4, column=1, pady=10)
-        ttk.Button(main_frame, text="Effacer les logs", command=self.clear_logs).grid(row=4, column=2, pady=10)
-        ttk.Button(main_frame, text="Quitter", command=self.root.quit).grid(row=4, column=3, pady=10)
-
-        # Logs
-        ttk.Label(main_frame, text="Logs:").grid(row=5, column=0, sticky=tk.W, pady=5)
-        self.log_text.grid(row=6, column=0, columnspan=4, pady=5, sticky="nsew")
-
-        # Résultats
-        ttk.Label(main_frame, text="Résultats:").grid(row=7, column=0, sticky=tk.W, pady=5)
-        self.results_tree.heading("Port", text="Port")
-        self.results_tree.heading("Service", text="Service")
-        self.results_tree.heading("Vulnérabilité", text="Vulnérabilité")
-        self.results_tree.heading("Sévérité", text="Sévérité")  # Ajout de la colonne "Sévérité"
-        self.results_tree.column("Port", width=80)
-        self.results_tree.column("Service", width=150)
-        self.results_tree.column("Vulnérabilité", width=200)
-        self.results_tree.column("Sévérité", width=100)
-        self.results_tree.grid(row=8, column=0, columnspan=4, pady=5, sticky="nsew")
-
-        # Configuration des poids des colonnes/ligne pour le redimensionnement
-        main_frame.columnconfigure(1, weight=1)
-        main_frame.rowconfigure(6, weight=1)
-        main_frame.rowconfigure(8, weight=1)
-
-    def log(self, message: str):
-        """Ajoute un message aux logs avec un timestamp."""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
-        self.log_text.see(tk.END)
-
-    def clear_logs(self):
-        """Efface les logs."""
-        self.log_text.delete(1.0, tk.END)
-
-    def start_scan_thread(self):
-        """Lance le scan dans un thread séparé pour éviter de bloquer l'interface."""
-        threading.Thread(target=self.run_scan, daemon=True).start()
-
-    def run_scan(self):
-        """Lance le scan de vulnérabilités."""
-        target = self.target.get()
-        if not target:
-            self.log("Erreur: Veuillez entrer une cible.")
-            messagebox.showerror("Erreur", "Veuillez entrer une cible.")
-            return
-
-        self.log(f"[*] Début du scan pour {target}...")
-        self.results_tree.delete(*self.results_tree.get_children())  # Efface les anciens résultats
-
-        try:
-            results = {"target": target, "open_ports": [], "vulnerabilities": []}
-            # Scan des ports avec la méthode choisie
-            nmap_results = self.scan_ports(target, self.ports.get(), self.scan_method.get())
-
-            for proto in nmap_results.all_protocols():
-                for port in nmap_results[proto]:
-                    service = nmap_results[proto][port]["name"]
-                    version = nmap_results[proto][port].get("version", "")
-                    results["open_ports"].append((port, f"{service} {version}"))
-                    self.results_tree.insert("", tk.END, values=(port, f"{service} {version}", "Aucune", "Faible"))
-
-                    # Tests de vulnérabilités
-                    for vuln_name, vuln_data in KNOWN_VULNERABILITIES.items():
-                        if port in vuln_data["ports"]:
-                            test_func = globals().get(vuln_data["test"])
-                            if test_func:
-                                is_vuln, status, severity = test_func(target, port)
-                                if is_vuln:
-                                    results["vulnerabilities"].append({"name": vuln_name, "status": status, "severity": severity})
-                                    self.results_tree.insert("", tk.END, values=(port, f"{service} {version}", f"{vuln_name}: {status}", severity))
-
-            # Génération du rapport
-            report_file = self.generate_report(results, self.report_format.get())
-            self.log(f"[+] Rapport généré: {report_file}")
-            messagebox.showinfo("Succès", f"Scan terminé. Rapport: {report_file}")
-
-        except Exception as e:
-            self.log(f"[-] Erreur lors du scan: {e}")
-            messagebox.showerror("Erreur", f"Erreur lors du scan: {e}")
-
-    def scan_ports(self, target: str, ports: str, method: str) -> nmap.PortScanner:
-        """Effectue un scan des ports avec nmap."""
-        nm = nmap.PortScanner()
-        self.log(f"[*] Scanning {target} avec la méthode {method} sur les ports {ports}...")
-        nm.scan(hosts=target, ports=ports, arguments=f'-s{method.lower()}')
-        return nm
-
-    def generate_report(self, results: dict, report_format: str) -> str:
-        """Génère un rapport dans le format spécifié."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_name = f"scan_{results['target']}_{timestamp}.{report_format}"
-        report_path = os.path.join(REPORT_DIR, report_name)
-
-        if report_format == "json":
-            with open(report_path, "w") as f:
-                json.dump(results, f, indent=4)
-        elif report_format == "html":
-            self.generate_html_report(results, report_path)
-        elif report_format == "txt":
-            self.generate_txt_report(results, report_path)
-
-        return report_path
-
-    def generate_html_report(self, results: dict, report_path: str):
-        """Génère un rapport au format HTML."""
-        with open(report_path, "w") as f:
-            f.write(f"<h1>Rapport de scan pour {results['target']}</h1>\n")
-            f.write("<h2>Ports ouverts</h2>\n<ul>\n")
-            for port, service in results["open_ports"]:
-                f.write(f"<li>Port {port}: {service}</li>\n")
-            f.write("</ul>\n<h2>Vulnérabilités détectées</h2>\n<ul>\n")
-            for vuln in results["vulnerabilities"]:
-                f.write(f"<li>{vuln['name']}: {vuln['status']} (Sévérité: {vuln['severity']})</li>\n")
-            f.write("</ul>\n")
-
-    def generate_txt_report(self, results: dict, report_path: str):
-        """Génère un rapport au format texte."""
-        with open(report_path, "w") as f:
-            f.write(f"Rapport de scan pour {results['target']}\n\n")
-            f.write("Ports ouverts:\n")
-            for port, service in results["open_ports"]:
-                f.write(f"- Port {port}: {service}\n")
-            f.write("\nVulnérabilités détectées:\n")
-            for vuln in results["vulnerabilities"]:
-                f.write(f"- {vuln['name']}: {vuln['status']} (Sévérité: {vuln['severity']})\n")
-
-    def open_report(self):
-        """Ouvre un rapport existant."""
-        file = filedialog.askopenfilename(initialdir=REPORT_DIR, title="Ouvrir un rapport", filetypes=[("Fichiers de rapport", "*.json *.html *.txt")])
-        if file:
-            os.system(f"xdg-open {file}" if os.name == "posix" else f"start {file}")
-
-# Exemple de fonction de test de vulnérabilité
-def test_heartbleed(target: str, port: int) -> tuple:
-    """Teste la vulnérabilité Heartbleed."""
-    # Logique de test ici (simulée)
-    return (True, "Vulnérable à Heartbleed", "Critique")
-
-def test_shellshock(target: str, port: int) -> tuple:
-    """Teste la vulnérabilité Shellshock."""
-    # Logique de test ici (simulée)
-    return (False, "Non vulnérable", "Faible")
-
+# --- Point d'entrée ---
 
 # --- Point d'entrée ---
 if __name__ == "__main__":
